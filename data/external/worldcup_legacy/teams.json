@@ -1,0 +1,52 @@
+{
+  "tournament": "2026 FIFA World Cup",
+  "hosts": ["United States", "Canada", "Mexico"],
+  "dates": "June 11 – July 19, 2026",
+  "total_teams": 48,
+  "groups": {
+    "A": ["Mexico", "South Africa", "South Korea", "Czech Republic"],
+    "B": ["Canada", "Bosnia and Herzegovina", "Qatar", "Switzerland"],
+    "C": ["Brazil", "Morocco", "Haiti", "Scotland"],
+    "D": ["United States", "Paraguay", "Australia", "Turkey"],
+    "E": ["Germany", "Curacao", "Ivory Coast", "Ecuador"],
+    "F": ["Netherlands", "Japan", "Sweden", "Tunisia"],
+    "G": ["Belgium", "Egypt", "Iran", "New Zealand"],
+    "H": ["Spain", "Cape Verde", "Saudi Arabia", "Uruguay"],
+    "I": ["France", "Senegal", "Iraq", "Norway"],
+    "J": ["Argentina", "Algeria", "Austria", "Jordan"],
+    "K": ["Portugal", "DR Congo", "Uzbekistan", "Colombia"],
+    "L": ["England", "Croatia", "Ghana", "Panama"]
+  },
+  "by_confederation": {
+    "AFC": {
+      "count": 9,
+      "qualification": "8 direct + 1 intercontinental playoff",
+      "teams": ["Japan", "Iran", "Jordan", "South Korea", "Uzbekistan", "Australia", "Qatar", "Saudi Arabia", "Iraq"]
+    },
+    "CAF": {
+      "count": 10,
+      "qualification": "9 direct + 1 intercontinental playoff",
+      "teams": ["Morocco", "Egypt", "Senegal", "Algeria", "Tunisia", "Ivory Coast", "Ghana", "South Africa", "Cape Verde", "DR Congo"]
+    },
+    "CONCACAF": {
+      "count": 6,
+      "qualification": "3 hosts + 3 direct qualifiers",
+      "teams": ["United States", "Canada", "Mexico", "Haiti", "Curacao", "Panama"]
+    },
+    "CONMEBOL": {
+      "count": 6,
+      "qualification": "6 direct",
+      "teams": ["Argentina", "Brazil", "Uruguay", "Colombia", "Ecuador", "Paraguay"]
+    },
+    "OFC": {
+      "count": 1,
+      "qualification": "1 direct",
+      "teams": ["New Zealand"]
+    },
+    "UEFA": {
+      "count": 16,
+      "qualification": "12 direct + 4 playoffs",
+      "teams": ["England", "France", "Spain", "Portugal", "Germany", "Netherlands", "Belgium", "Croatia", "Switzerland", "Norway", "Scotland", "Austria", "Bosnia and Herzegovina", "Sweden", "Turkey", "Czech Republic"]
+    }
+  }
+}

@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+*.key
+secrets.*
+
+# Local runtime/cache files
+data/processed/market_monitor/
+data/processed/off_field_sentiment.json
+data/processed/off_field_sentiment.csv
+data/processed/odds_api_usage.json
+data/raw/odds_api_worldcup_odds.json
+*.log
+
+# Large/raw datasets
+data/raw/
+data/processed/*.csv
+data/processed/*.json
+data/processed/*.jsonl
+!data/README.md
+
+# Optional full Transfermarkt exports are useful locally but too large for GitHub.
+data/external/worldcup_legacy/Football_Data_from_Transfermarkt/appearances.csv
+data/external/worldcup_legacy/Football_Data_from_Transfermarkt/games.csv
+data/external/worldcup_legacy/Football_Data_from_Transfermarkt/game_lineups.csv
+data/external/worldcup_legacy/Football_Data_from_Transfermarkt/game_events.csv
+data/external/worldcup_legacy/Football_Data_from_Transfermarkt/player_valuations.csv
+data/external/worldcup_legacy/Football_Data_from_Transfermarkt/club_games.csv
+data/external/worldcup_legacy/Football_Data_from_Transfermarkt/transfers.csv
+
+# Model artifacts
+models/
+
+# Local reports and experimental notes
+reports/
+notebooks/.ipynb_checkpoints/
+betting_strategy_patch.md
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
