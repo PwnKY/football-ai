@@ -207,9 +207,9 @@ date
 - 赛前早期预测不应使用终盘赔率。
 - 临场预测可以使用终盘赔率，但需要在报告中说明预测时点。
 
-## GitHub 上传建议
+## 数据与产物管理
 
-默认 `.gitignore` 会忽略：
+默认 `.gitignore` 会忽略本地生成的数据和模型产物：
 
 ```text
 data/raw/
@@ -221,21 +221,7 @@ reports/
 .env
 ```
 
-仓库会保留 `data/external/` 中的轻量种子数据。完整 Transfermarkt 大表体积很大，不建议上传 GitHub。用户可以自行下载后放入对应目录，脚本会自动增强训练。
-
-如果你的 Git 仓库根目录在 `football-ai` 的父目录，上传时不要直接运行：
-
-```powershell
-git add .
-```
-
-推荐只添加项目目录：
-
-```powershell
-git add football-ai
-```
-
-或者在 `football-ai` 内单独初始化 Git 仓库。
+仓库保留 `data/external/` 中的轻量种子数据，用于保证基础流程可复现。完整 Transfermarkt 大表体积较大，适合作为本地增强数据使用；放入对应目录后，脚本会自动增强训练。
 
 ## 后续可继续增强的特征
 
