@@ -105,6 +105,30 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+## 本地 API Key
+
+本地 API key 放在项目根目录的 `.env` 文件里：
+
+```text
+football-ai/.env
+```
+
+可以从 `.env.example` 复制一份：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+然后填写：
+
+```text
+DEEPSEEK_API_KEY=你的 deepseek key
+THE_ODDS_API_KEY=你的 The Odds API key
+ODDS_API_KEY=同一个 The Odds API key，兼容旧脚本
+```
+
+`.env` 已被 Git 忽略，不会提交到仓库。
+
 ## 基础训练流程
 
 进入项目目录：
@@ -160,6 +184,16 @@ python src\train_poisson.py --input data\raw\matches.csv --alpha 0.1
 ```powershell
 python src\train_ensemble.py
 ```
+
+## 网页端赛程更新
+
+网页仪表盘启动时会在后台刷新 2026 世界杯赛程输入表：
+
+```text
+data/processed/worldcup_2026_prediction_inputs.csv
+```
+
+数据来源是 `rezarahiminia/worldcup2026` 的赛程、球队和球场文件。切换日期时会优先读取本地输入表；如果输入表过旧或不存在，网页端会自动触发后台重建。点击强制刷新也会触发重建。
 
 ## 数据文件说明
 

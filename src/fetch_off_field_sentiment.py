@@ -48,7 +48,25 @@ SPORTTERY_SNAPSHOT_PATH = MARKET_MONITOR_DIR / "sporttery_latest_snapshot.csv"
 
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-# Keep API keys out of source control. Set DEEPSEEK_API_KEY in your shell.
+def load_local_env() -> None:
+    """Load optional project-root .env values without requiring extra packages."""
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_local_env()
+
+# Keep API keys out of source control. Set DEEPSEEK_API_KEY in .env or shell.
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = "deepseek-v4-flash"

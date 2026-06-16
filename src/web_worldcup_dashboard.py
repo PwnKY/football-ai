@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pickle
 import re
 import threading
@@ -28,6 +29,28 @@ import pandas as pd
 import requests
 from flask import Flask, jsonify, render_template_string, request
 
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ENV_PATH = PROJECT_ROOT / ".env"
+
+
+def _load_local_env() -> None:
+    """Load local .env values before modules read API keys from os.environ."""
+    if not ENV_PATH.exists():
+        return
+    for raw_line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_local_env()
+
 from fetch_off_field_sentiment import (
     DEEPSEEK_API_KEY as OFF_FIELD_DEEPSEEK_API_KEY,
     FRESHNESS_RULE_VERSION as OFF_FIELD_FRESHNESS_RULE_VERSION,
@@ -37,6 +60,7 @@ from fetch_off_field_sentiment import (
     save_outputs as save_off_field_sentiment_outputs,
 )
 from group_motivation_features import MOTIVATION_COLUMNS, motivation_for_single_match
+from build_2026_prediction_inputs import build_prediction_input_table
 from live_worldcup_dashboard import (
     fetch_recent_polymarket_trades,
     implied_probs_from_had,
@@ -55,10 +79,11 @@ from recent_form_features import recent_form_for_single_match
 
 
 app = Flask(__name__)
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATE = tomorrow_shanghai()
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 SPORTTERY_CACHE_PATH = PROJECT_ROOT / "data" / "processed" / "market_monitor" / "sporttery_latest_snapshot.csv"
+PREDICTION_INPUT_PATH = PROJECT_ROOT / "data" / "processed" / "worldcup_2026_prediction_inputs.csv"
+PREDICTION_INPUT_REFRESH_MAX_AGE_SECONDS = 6 * 60 * 60
 ENABLE_POLYMARKET = False
 
 POLYMARKET_TEAM_CODES = {
@@ -94,6 +119,8 @@ OFF_FIELD_REFRESHING_DATES: set[str] = set()
 OFF_FIELD_REFRESH_LOCK = threading.Lock()
 SPORTTERY_REFRESHING = False
 SPORTTERY_REFRESH_LOCK = threading.Lock()
+PREDICTION_INPUT_REFRESHING = False
+PREDICTION_INPUT_REFRESH_LOCK = threading.Lock()
 
 TEAM_NAME_MAP = {
     "西班牙": "Spain",
@@ -964,6 +991,56 @@ def _schedule_sporttery_snapshot_refresh() -> bool:
     return True
 
 
+def _prediction_input_is_stale() -> bool:
+    if not PREDICTION_INPUT_PATH.exists():
+        return True
+    age_seconds = time.time() - PREDICTION_INPUT_PATH.stat().st_mtime
+    return age_seconds > PREDICTION_INPUT_REFRESH_MAX_AGE_SECONDS
+
+
+def _refresh_prediction_inputs_background(force: bool = False) -> None:
+    """Refresh 2026 schedule/prediction input table without blocking the page."""
+    global PREDICTION_INPUT_REFRESHING
+    try:
+        if not force and not _prediction_input_is_stale():
+            return
+        print("[info] Refreshing 2026 prediction input table...")
+        table = build_prediction_input_table(
+            include_completed=True,
+            use_live_sporttery=False,
+            add_predictions=True,
+            refresh_worldcup2026_repo=True,
+        )
+        PREDICTION_INPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        table.to_csv(PREDICTION_INPUT_PATH, index=False, encoding="utf-8")
+        _load_fixture_metadata_table.cache_clear()
+        print(f"[info] Refreshed prediction inputs: {PREDICTION_INPUT_PATH} rows={len(table)}")
+    except Exception as exc:
+        print(f"[warn] prediction input refresh failed: {exc}")
+    finally:
+        with PREDICTION_INPUT_REFRESH_LOCK:
+            PREDICTION_INPUT_REFRESHING = False
+
+
+def _schedule_prediction_input_refresh(force: bool = False) -> bool:
+    """Start at most one background fixture/prediction-input refresh."""
+    global PREDICTION_INPUT_REFRESHING
+    if not force and not _prediction_input_is_stale():
+        return False
+    with PREDICTION_INPUT_REFRESH_LOCK:
+        if PREDICTION_INPUT_REFRESHING:
+            return False
+        PREDICTION_INPUT_REFRESHING = True
+    worker = threading.Thread(
+        target=_refresh_prediction_inputs_background,
+        args=(force,),
+        name="prediction-input-refresh",
+        daemon=True,
+    )
+    worker.start()
+    return True
+
+
 @lru_cache(maxsize=1)
 def _load_local_model_bundle() -> dict:
     ensemble_model_path = PROJECT_ROOT / "models" / "ensemble_model.pkl"
@@ -1053,7 +1130,8 @@ def _team_display(team_name: str) -> str:
 
 @lru_cache(maxsize=1)
 def _load_fixture_metadata_table() -> pd.DataFrame:
-    path = PROJECT_ROOT / "data" / "processed" / "worldcup_2026_prediction_inputs.csv"
+    _schedule_prediction_input_refresh(force=False)
+    path = PREDICTION_INPUT_PATH
     if not path.exists():
         return pd.DataFrame()
     frame = pd.read_csv(path)
@@ -2685,6 +2763,8 @@ def build_dashboard_payload(
     force_refresh: bool = False,
 ) -> dict:
     if force_refresh:
+        _schedule_prediction_input_refresh(force=True)
+    if force_refresh:
         _clear_runtime_caches()
 
     snapshot_error = ""
@@ -2956,6 +3036,8 @@ def main() -> None:
     args = parse_args()
     global DEFAULT_DATE
     DEFAULT_DATE = args.date
+    _schedule_prediction_input_refresh(force=False)
+    _schedule_sporttery_snapshot_refresh()
     print(f"Open http://{args.host}:{args.port}?date={args.date}")
     app.run(host=args.host, port=args.port, debug=args.debug, use_reloader=args.debug)
 
