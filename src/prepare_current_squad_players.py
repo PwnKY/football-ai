@@ -20,6 +20,8 @@ RAW_SQUAD_CSV = RAW_DATA_DIR / "worldcup_2026_squads_fifa.csv"
 CURRENT_PLAYERS_CSV = PROCESSED_DATA_DIR / "current_squad_players.csv"
 TEAM_FEATURES_CSV = PROCESSED_DATA_DIR / "current_squad_team_features.csv"
 FC26_PLAYERS_CSV = RAW_DATA_DIR / "kaggle_fc26_ratings" / "ea_fc26_players.csv"
+EA_OFFICIAL_FC26_CSV = RAW_DATA_DIR / "ea_fc26_official_ratings.csv"
+SOFIFA_FC26_NATIONAL_TEAMS_CSV = RAW_DATA_DIR / "sofifa_fc26_national_teams.csv"
 TRANSFERMARKT_PLAYERS_CSV = (
     SOURCE_WORLDCUP_DIR / "Football_Data_from_Transfermarkt" / "players.csv"
 )
@@ -55,6 +57,14 @@ NATIONALITY_ALIASES = {
     "Côte d'Ivoire": "Ivory Coast",
     "Ivory Coast": "Ivory Coast",
 }
+NATIONALITY_ALIASES.update(
+    {
+        "Cape Verde Islands": "Cape Verde",
+        "Curaçao": "Curacao",
+        "Côte d'Ivoire": "Ivory Coast",
+        "Holland": "Netherlands",
+    }
+)
 
 POSITIONS = {"GK", "DF", "MF", "FW"}
 
@@ -75,7 +85,9 @@ NORMALIZED_NATIONALITY_ALIASES.update(
     {
         "cote d ivoire": "Ivory Coast",
         "c te d ivoire": "Ivory Coast",
+        "cape verde islands": "Cape Verde",
         "cura ao": "Curacao",
+        "holland": "Netherlands",
         "t rkiye": "Turkey",
     }
 )
@@ -110,6 +122,23 @@ def normalize_person_name(name):
     text = text.lower()
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return " ".join(text.split())
+
+
+def first_existing_column(df, candidates):
+    """Return the first present column from a list of possible source names."""
+    lower_to_original = {str(col).strip().lower(): col for col in df.columns}
+    for candidate in candidates:
+        key = candidate.strip().lower()
+        if key in lower_to_original:
+            return lower_to_original[key]
+    return None
+
+
+def get_optional_value(row, col):
+    """Read a row value only when the source column exists."""
+    if not col:
+        return pd.NA
+    return row.get(col, pd.NA)
 
 
 def parse_date_series(values, dayfirst=False):
@@ -386,6 +415,276 @@ def attach_kaggle_fc26(enriched_players, fc26_path):
     return pd.DataFrame(output_rows)
 
 
+def attach_official_ea_fc26(enriched_players, official_path):
+    """
+    Use EA's official public FC 26 ratings page as a fallback source.
+
+    The official site has the same important fields as the Kaggle file, but a
+    slightly different naming/nationality convention. We only fill players that
+    did not already match the Kaggle source, and we keep a separate flag so the
+    coverage report can explain where each rating came from.
+    """
+    enriched_players = enriched_players.copy()
+    if not official_path.exists():
+        enriched_players["matched_ea_official_fc26"] = False
+        enriched_players["ea_official_fc26_match_method"] = ""
+        return enriched_players
+
+    official = pd.read_csv(official_path)
+    official["ea_birthdate"] = parse_date_series(official["birthdate"], dayfirst=False)
+    official["ea_nationality_norm"] = official["nationality"].map(normalize_nationality)
+    official["ea_full_name"] = (
+        official["firstName"].fillna("") + " " + official["lastName"].fillna("")
+    ).str.strip()
+    official["name_norm"] = official["ea_full_name"].map(normalize_person_name)
+    official["common_norm"] = official["commonName"].fillna("").map(normalize_person_name)
+    official["last_norm"] = official["lastName"].fillna("").map(normalize_person_name)
+
+    value_cols = {
+        "overallRating": "kaggle_fc26_overallRating",
+        "pac": "kaggle_fc26_pac",
+        "sho": "kaggle_fc26_sho",
+        "pas": "kaggle_fc26_pas",
+        "dri": "kaggle_fc26_dri",
+        "def": "kaggle_fc26_def",
+        "phy": "kaggle_fc26_phy",
+        "position": "kaggle_fc26_position",
+        "team": "kaggle_fc26_team",
+        "nationality": "kaggle_fc26_nationality",
+        "height": "kaggle_fc26_height",
+        "weight": "kaggle_fc26_weight",
+    }
+
+    by_exact = {}
+    by_dob_nat = {}
+    for _, row in official.iterrows():
+        values = {target: row.get(source) for source, target in value_cols.items()}
+        values["kaggle_fc26_name"] = row.get("ea_full_name")
+        values["kaggle_fc26_birthdate"] = row.get("ea_birthdate")
+
+        names = [row.get("name_norm"), row.get("common_norm")]
+        for name in names:
+            if name:
+                by_exact[(name, row["ea_birthdate"], row["ea_nationality_norm"])] = values
+        key = (row["ea_birthdate"], row["ea_nationality_norm"])
+        by_dob_nat.setdefault(key, []).append((row.get("name_norm") or "", values))
+
+    output_rows = []
+    for _, player in enriched_players.iterrows():
+        row = player.to_dict()
+        if bool(row.get("matched_kaggle_fc26")):
+            row["matched_ea_official_fc26"] = False
+            row["ea_official_fc26_match_method"] = ""
+            output_rows.append(row)
+            continue
+
+        dob = row.get("official_birthdate")
+        if pd.isna(dob):
+            dob = parse_date_series(pd.Series([row.get("date_of_birth")]), dayfirst=True).iloc[0]
+        nationality = normalize_nationality(row["team"])
+        names = [
+            normalize_person_name(row.get("display_name")),
+            normalize_person_name(row.get("player_name_fifa")),
+            normalize_person_name(row.get("name_on_shirt")),
+            normalize_person_name(f"{row.get('first_names', '')} {row.get('last_names', '')}"),
+            normalize_person_name(f"{row.get('last_names', '')} {row.get('first_names', '')}"),
+        ]
+        names = [name for name in dict.fromkeys(names) if name]
+
+        matched = {}
+        method = ""
+        for name in names:
+            exact_key = (name, dob, nationality)
+            if exact_key in by_exact:
+                matched = by_exact[exact_key]
+                method = "official_exact_name_dob_nationality"
+                break
+
+        if not matched:
+            official_candidates = by_dob_nat.get((dob, nationality), [])
+            best_values = {}
+            best_score = 0.0
+            official_token_floor = 0
+            for official_name, values in official_candidates:
+                official_tokens = set(official_name.split())
+                official_compact = official_name.replace(" ", "")
+                for candidate_name in names:
+                    candidate_tokens = set(candidate_name.split())
+                    candidate_compact = candidate_name.replace(" ", "")
+                    overlap = len(official_tokens & candidate_tokens)
+                    score = overlap / max(1, min(len(official_tokens), len(candidate_tokens)))
+                    if official_compact and candidate_compact and (
+                        official_compact in candidate_compact
+                        or candidate_compact in official_compact
+                    ):
+                        score = max(score, 0.92)
+                    if score > best_score:
+                        best_score = score
+                        best_values = values
+                        official_token_floor = min(len(official_tokens), len(candidate_tokens))
+
+            if best_score >= 0.67 and official_token_floor >= 2:
+                matched = best_values
+                method = f"official_dob_nationality_fuzzy_{best_score:.2f}"
+
+        row["matched_ea_official_fc26"] = bool(matched)
+        row["ea_official_fc26_match_method"] = method
+        if matched:
+            row.update(matched)
+            row["matched_kaggle_fc26"] = True
+            row["kaggle_fc26_match_method"] = method
+        output_rows.append(row)
+
+    return pd.DataFrame(output_rows)
+
+
+def attach_sofifa_fc26(enriched_players, sofifa_path):
+    """
+    Use manually exported SoFIFA national-team FC26 rows as a final fallback.
+
+    SoFIFA blocks simple server-side scraping for some requests, so this project
+    treats it as a stable import file instead of a brittle crawler. Put rows in:
+      data/raw/sofifa_fc26_national_teams.csv
+
+    Supported column names are intentionally flexible. For example:
+      team, player_name, overall, pace, shooting, passing, dribbling, defending,
+      physicality, position, club, date_of_birth
+
+    Or common SoFIFA-style names:
+      Team, Name, OA/OVR/Overall, PAC, SHO, PAS, DRI, DEF, PHY, POS, Club
+    """
+    enriched_players = enriched_players.copy()
+    if not sofifa_path.exists():
+        enriched_players["matched_sofifa_fc26"] = False
+        enriched_players["sofifa_fc26_match_method"] = ""
+        return enriched_players
+
+    sofifa = pd.read_csv(sofifa_path)
+    if sofifa.empty:
+        enriched_players["matched_sofifa_fc26"] = False
+        enriched_players["sofifa_fc26_match_method"] = ""
+        return enriched_players
+
+    team_col = first_existing_column(sofifa, ["team", "national_team", "country", "nation", "nationality"])
+    name_col = first_existing_column(sofifa, ["player_name", "name", "short_name", "known_as"])
+    dob_col = first_existing_column(sofifa, ["date_of_birth", "birthdate", "dob"])
+    position_col = first_existing_column(sofifa, ["position", "pos"])
+    club_col = first_existing_column(sofifa, ["club", "club_name", "team_name"])
+    height_col = first_existing_column(sofifa, ["height", "height_cm"])
+    weight_col = first_existing_column(sofifa, ["weight", "weight_kg"])
+
+    value_cols = {
+        "overall": first_existing_column(sofifa, ["overall", "overallRating", "oa", "ova", "ovr", "rating"]),
+        "pac": first_existing_column(sofifa, ["pac", "pace"]),
+        "sho": first_existing_column(sofifa, ["sho", "shooting"]),
+        "pas": first_existing_column(sofifa, ["pas", "passing"]),
+        "dri": first_existing_column(sofifa, ["dri", "dribbling"]),
+        "def": first_existing_column(sofifa, ["def", "defending"]),
+        "phy": first_existing_column(sofifa, ["phy", "physicality", "physic"]),
+    }
+
+    if not name_col:
+        enriched_players["matched_sofifa_fc26"] = False
+        enriched_players["sofifa_fc26_match_method"] = "missing_name_column"
+        return enriched_players
+
+    sofifa = sofifa.copy()
+    sofifa["sofifa_name_norm"] = sofifa[name_col].map(normalize_person_name)
+    sofifa["sofifa_team_norm"] = (
+        sofifa[team_col].map(normalize_nationality) if team_col else ""
+    )
+    sofifa["sofifa_birthdate"] = (
+        parse_date_series(sofifa[dob_col], dayfirst=False) if dob_col else pd.NaT
+    )
+
+    for col in value_cols.values():
+        if col:
+            sofifa[col] = pd.to_numeric(sofifa[col], errors="coerce")
+
+    by_name_team = {}
+    by_name_dob_team = {}
+    for _, row in sofifa.iterrows():
+        name_norm = row.get("sofifa_name_norm")
+        team_norm = row.get("sofifa_team_norm")
+        if not name_norm:
+            continue
+
+        values = {
+            "kaggle_fc26_name": row.get(name_col),
+            "kaggle_fc26_overallRating": get_optional_value(row, value_cols["overall"]),
+            "kaggle_fc26_pac": get_optional_value(row, value_cols["pac"]),
+            "kaggle_fc26_sho": get_optional_value(row, value_cols["sho"]),
+            "kaggle_fc26_pas": get_optional_value(row, value_cols["pas"]),
+            "kaggle_fc26_dri": get_optional_value(row, value_cols["dri"]),
+            "kaggle_fc26_def": get_optional_value(row, value_cols["def"]),
+            "kaggle_fc26_phy": get_optional_value(row, value_cols["phy"]),
+            "kaggle_fc26_position": get_optional_value(row, position_col),
+            "kaggle_fc26_team": get_optional_value(row, club_col),
+            "kaggle_fc26_nationality": get_optional_value(row, team_col),
+            "kaggle_fc26_height": get_optional_value(row, height_col),
+            "kaggle_fc26_weight": get_optional_value(row, weight_col),
+            "kaggle_fc26_birthdate": row.get("sofifa_birthdate"),
+        }
+        values = {
+            key: value
+            for key, value in values.items()
+            if not (isinstance(value, float) and pd.isna(value))
+        }
+
+        by_name_team[(name_norm, team_norm)] = values
+        dob = row.get("sofifa_birthdate")
+        if not pd.isna(dob):
+            by_name_dob_team[(name_norm, dob, team_norm)] = values
+
+    output_rows = []
+    for _, player in enriched_players.iterrows():
+        row = player.to_dict()
+        if bool(row.get("matched_kaggle_fc26")):
+            row["matched_sofifa_fc26"] = False
+            row["sofifa_fc26_match_method"] = ""
+            output_rows.append(row)
+            continue
+
+        dob = row.get("official_birthdate")
+        if pd.isna(dob):
+            dob = parse_date_series(pd.Series([row.get("date_of_birth")]), dayfirst=True).iloc[0]
+        team = normalize_nationality(row["team"])
+        names = [
+            normalize_person_name(row.get("display_name")),
+            normalize_person_name(row.get("player_name_fifa")),
+            normalize_person_name(row.get("name_on_shirt")),
+            normalize_person_name(f"{row.get('first_names', '')} {row.get('last_names', '')}"),
+            normalize_person_name(f"{row.get('last_names', '')} {row.get('first_names', '')}"),
+        ]
+        names = [name for name in dict.fromkeys(names) if name]
+
+        matched = {}
+        method = ""
+        for name in names:
+            key = (name, dob, team)
+            if key in by_name_dob_team:
+                matched = by_name_dob_team[key]
+                method = "sofifa_exact_name_dob_team"
+                break
+        if not matched:
+            for name in names:
+                key = (name, team)
+                if key in by_name_team:
+                    matched = by_name_team[key]
+                    method = "sofifa_exact_name_team"
+                    break
+
+        row["matched_sofifa_fc26"] = bool(matched)
+        row["sofifa_fc26_match_method"] = method
+        if matched:
+            row.update(matched)
+            row["matched_kaggle_fc26"] = True
+            row["kaggle_fc26_match_method"] = method
+        output_rows.append(row)
+
+    return pd.DataFrame(output_rows)
+
+
 def attach_transfermarkt_profile(enriched_players, transfermarkt_path):
     """
     Attach Transfermarkt profile market values from the local Kaggle dataset.
@@ -540,6 +839,8 @@ def build_team_features(players):
         "display_name": "count",
         "matched_local_stats": "sum",
         "matched_kaggle_fc26": "sum",
+        "matched_ea_official_fc26": "sum",
+        "matched_sofifa_fc26": "sum",
         "matched_transfermarkt_profile": "sum",
         "height_cm": "mean",
         "caps": ["mean", "sum"],
@@ -562,6 +863,8 @@ def build_team_features(players):
             "display_name_count": "squad_player_count",
             "matched_local_stats_sum": "matched_player_stats_count",
             "matched_kaggle_fc26_sum": "matched_kaggle_fc26_count",
+            "matched_ea_official_fc26_sum": "matched_ea_official_fc26_count",
+            "matched_sofifa_fc26_sum": "matched_sofifa_fc26_count",
             "matched_transfermarkt_profile_sum": "matched_transfermarkt_profile_count",
         }
     ).reset_index()
@@ -573,18 +876,28 @@ def build_team_features(players):
         value_col = "tm_profile_market_value_in_eur"
         if value_col in group.columns:
             values = pd.to_numeric(group[value_col], errors="coerce").dropna()
-            values = values.sort_values(ascending=False).head(11)
-            row["squad_top11_tm_value_count"] = len(values)
-            row["squad_top11_tm_value_sum"] = values.sum() if len(values) else pd.NA
-            row["squad_top11_tm_value_mean"] = values.mean() if len(values) else pd.NA
+            values = values.sort_values(ascending=False)
+            top11_values = values.head(11)
+            top3_values = values.head(3)
+            row["squad_top1_tm_value"] = values.iloc[0] if len(values) else pd.NA
+            row["squad_top3_tm_value_sum"] = top3_values.sum() if len(top3_values) else pd.NA
+            row["squad_top3_tm_value_mean"] = top3_values.mean() if len(top3_values) else pd.NA
+            row["squad_top11_tm_value_count"] = len(top11_values)
+            row["squad_top11_tm_value_sum"] = top11_values.sum() if len(top11_values) else pd.NA
+            row["squad_top11_tm_value_mean"] = top11_values.mean() if len(top11_values) else pd.NA
 
         rating_col = "kaggle_fc26_overallRating"
         if rating_col in group.columns:
             ratings = pd.to_numeric(group[rating_col], errors="coerce").dropna()
-            ratings = ratings.sort_values(ascending=False).head(11)
-            row["squad_top11_fc26_count"] = len(ratings)
-            row["squad_top11_fc26_sum"] = ratings.sum() if len(ratings) else pd.NA
-            row["squad_top11_fc26_mean"] = ratings.mean() if len(ratings) else pd.NA
+            ratings = ratings.sort_values(ascending=False)
+            top11_ratings = ratings.head(11)
+            top3_ratings = ratings.head(3)
+            row["squad_top1_fc26"] = ratings.iloc[0] if len(ratings) else pd.NA
+            row["squad_top3_fc26_sum"] = top3_ratings.sum() if len(top3_ratings) else pd.NA
+            row["squad_top3_fc26_mean"] = top3_ratings.mean() if len(top3_ratings) else pd.NA
+            row["squad_top11_fc26_count"] = len(top11_ratings)
+            row["squad_top11_fc26_sum"] = top11_ratings.sum() if len(top11_ratings) else pd.NA
+            row["squad_top11_fc26_mean"] = top11_ratings.mean() if len(top11_ratings) else pd.NA
 
         top11_features.append(row)
 
@@ -608,6 +921,11 @@ def main():
     squads_json = SOURCE_WORLDCUP_DIR / "squads.json"
     enriched_players = attach_existing_player_stats(official_squad, squads_json)
     enriched_players = attach_kaggle_fc26(enriched_players, FC26_PLAYERS_CSV)
+    enriched_players = attach_official_ea_fc26(enriched_players, EA_OFFICIAL_FC26_CSV)
+    enriched_players = attach_sofifa_fc26(
+        enriched_players,
+        SOFIFA_FC26_NATIONAL_TEAMS_CSV,
+    )
     enriched_players = attach_transfermarkt_profile(
         enriched_players,
         TRANSFERMARKT_PLAYERS_CSV,
@@ -635,6 +953,16 @@ def main():
         "Matched Kaggle FC26 rows: "
         f"{int(enriched_players['matched_kaggle_fc26'].sum())} / {len(enriched_players)}"
     )
+    if "matched_ea_official_fc26" in enriched_players.columns:
+        print(
+            "Matched EA official FC26 fallback rows: "
+            f"{int(enriched_players['matched_ea_official_fc26'].sum())} / {len(enriched_players)}"
+        )
+    if "matched_sofifa_fc26" in enriched_players.columns:
+        print(
+            "Matched SoFIFA FC26 fallback rows: "
+            f"{int(enriched_players['matched_sofifa_fc26'].sum())} / {len(enriched_players)}"
+        )
     print(
         "Matched Transfermarkt profile rows: "
         f"{int(enriched_players['matched_transfermarkt_profile'].sum())} / {len(enriched_players)}"

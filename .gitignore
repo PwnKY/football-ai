@@ -22,7 +22,8 @@ data/raw/odds_api_worldcup_odds.json
 *.log
 
 # Large/raw datasets
-data/raw/
+data/raw/*
+!data/raw/sofifa_fc26_national_teams.csv
 data/processed/*.csv
 data/processed/*.json
 data/processed/*.jsonl

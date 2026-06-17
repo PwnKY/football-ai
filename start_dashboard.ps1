@@ -1,5 +1,5 @@
 param(
-    [string]$Date = "2026-06-17",
+    [string]$Date = "",
     [int]$Port = 5050,
     [switch]$DebugMode
 )
@@ -18,13 +18,20 @@ foreach ($process in $oldProcesses) {
     Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
 }
 
-$argsList = @("src\web_worldcup_dashboard.py", "--date", $Date, "--port", "$Port")
+$argsList = @("src\web_worldcup_dashboard.py", "--port", "$Port")
+if (-not [string]::IsNullOrWhiteSpace($Date)) {
+    $argsList += @("--date", $Date)
+}
 if ($DebugMode) {
     $argsList += "--debug"
 }
 
 Write-Host "Starting dashboard..."
-Write-Host "URL: http://127.0.0.1:$Port/?date=$Date"
+if ([string]::IsNullOrWhiteSpace($Date)) {
+    Write-Host "URL: http://127.0.0.1:$Port/ (auto date)"
+} else {
+    Write-Host "URL: http://127.0.0.1:$Port/?date=$Date"
+}
 Write-Host "Old dashboard processes stopped: $($oldProcesses.Count)"
 
 python @argsList

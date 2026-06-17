@@ -1,5 +1,6 @@
 ﻿import argparse
 import json
+import math
 import pickle
 from pathlib import Path
 
@@ -85,6 +86,75 @@ WORLDCUP2026_PLACEHOLDER_TEAMS = {
     "IC Path 2 Winner": "Iraq",
     "Curaçao": "Curacao",
 }
+
+
+def _numeric(value) -> float | None:
+    try:
+        number = float(value)
+        if pd.isna(number):
+            return None
+        return number
+    except (TypeError, ValueError):
+        return None
+
+
+def _renormalize(values: list[float]) -> list[float]:
+    clipped = [max(0.001, float(value)) for value in values]
+    total = sum(clipped)
+    if total <= 0:
+        return [1 / 3, 1 / 3, 1 / 3]
+    return [value / total for value in clipped]
+
+
+def _strength_sanity_adjustment(probabilities, feature_row: pd.Series) -> list[float]:
+    """
+    Nudge no-odds fixtures when the strength gap is extreme.
+
+    Tree models can become overly draw-heavy when no live odds are available.
+    This transparent post-model prior only uses pre-match strength signals and
+    keeps the movement bounded, so it cannot overpower real market odds.
+    """
+    home_odds = _numeric(feature_row.get("closing_home_odds"))
+    draw_odds = _numeric(feature_row.get("closing_draw_odds"))
+    away_odds = _numeric(feature_row.get("closing_away_odds"))
+    if home_odds and draw_odds and away_odds:
+        return [float(value) for value in probabilities]
+
+    score = 0.0
+    components = 0
+
+    elo_diff = _numeric(feature_row.get("elo_diff"))
+    if elo_diff is not None:
+        score += max(-1.2, min(1.2, elo_diff / 350.0))
+        components += 1
+
+    fifa_diff = _numeric(feature_row.get("fifa_points_diff"))
+    if fifa_diff is not None:
+        score += max(-0.8, min(0.8, fifa_diff / 260.0))
+        components += 1
+
+    fc26_diff = _numeric(feature_row.get("squad_squad_top1_fc26_diff"))
+    if fc26_diff is not None:
+        score += max(-0.9, min(0.9, fc26_diff / 24.0))
+        components += 1
+
+    tm_home = _numeric(feature_row.get("home_squad_squad_top1_tm_value"))
+    tm_away = _numeric(feature_row.get("away_squad_squad_top1_tm_value"))
+    if tm_home is not None and tm_away is not None and tm_home > 0 and tm_away > 0:
+        score += max(-0.9, min(0.9, (math.log1p(tm_home) - math.log1p(tm_away)) / 4.0))
+        components += 1
+
+    if components < 2 or abs(score) < 1.15:
+        return [float(value) for value in probabilities]
+
+    adjusted = [float(value) for value in probabilities]
+    target = 0 if score > 0 else 2
+    opposite = 2 if target == 0 else 0
+    shift = min(0.16, 0.045 * abs(score))
+    adjusted[target] += shift
+    adjusted[1] -= shift * 0.55
+    adjusted[opposite] -= shift * 0.45
+    return _renormalize(adjusted)
 
 
 def select_model_bundle_paths() -> tuple[Path, Path, str]:
@@ -498,8 +568,13 @@ def build_prediction_input_table(
     )
     output["all_required_features_present"] = output["missing_feature_count"].eq(0)
 
+    # The model still needs numeric values, so missing prediction features are
+    # filled with training medians below. The CSV we write for humans/the web UI
+    # should keep the raw feature values, though. In particular, a missing odds
+    # column must remain blank instead of becoming 0.0, otherwise the strategy
+    # layer can mistake "no market data" for a real price.
     filled_features = raw_features.fillna(medians).fillna(0)
-    output = pd.concat([output, filled_features[feature_names].copy()], axis=1)
+    output = pd.concat([output, raw_features[feature_names].copy()], axis=1)
 
     if add_predictions:
         if not model_path.exists():
@@ -507,11 +582,21 @@ def build_prediction_input_table(
         else:
             with open(model_path, "rb") as f:
                 model = pickle.load(f)
-            probabilities = model.predict_proba(filled_features[feature_names])
+            raw_probabilities = model.predict_proba(filled_features[feature_names])
+            probabilities = []
+            for row_index, probability_row in enumerate(raw_probabilities):
+                probabilities.append(
+                    _strength_sanity_adjustment(
+                        probability_row,
+                        output.iloc[row_index],
+                    )
+                )
+            probabilities = pd.DataFrame(probabilities, columns=["home", "draw", "away"]).to_numpy()
             try:
                 predictions = model.predict(filled_features[feature_names])
             except Exception:
                 predictions = probabilities.argmax(axis=1)
+            predictions = probabilities.argmax(axis=1)
             output["model_home_win_prob"] = probabilities[:, 0]
             output["model_draw_prob"] = probabilities[:, 1]
             output["model_away_win_prob"] = probabilities[:, 2]

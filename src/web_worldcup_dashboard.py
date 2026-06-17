@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pickle
 import re
@@ -79,7 +80,7 @@ from recent_form_features import recent_form_for_single_match
 
 
 app = Flask(__name__)
-DEFAULT_DATE = tomorrow_shanghai()
+DEFAULT_DATE = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 SPORTTERY_CACHE_PATH = PROJECT_ROOT / "data" / "processed" / "market_monitor" / "sporttery_latest_snapshot.csv"
 PREDICTION_INPUT_PATH = PROJECT_ROOT / "data" / "processed" / "worldcup_2026_prediction_inputs.csv"
@@ -1261,6 +1262,64 @@ def _fixture_rows_for_dashboard(target_date: str, existing_keys: set[tuple[str, 
     return fixtures
 
 
+def _dashboard_fixture_count(target_date: str) -> int:
+    """Count scheduled World Cup fixtures for the dashboard's China date."""
+    return len(_fixture_rows_for_dashboard(target_date, set()))
+
+
+def _sporttery_open_match_count(snapshot: pd.DataFrame, target_date: str) -> int:
+    """Count currently available Sporttery matches for one China date."""
+    if snapshot.empty or "match_date" not in snapshot.columns:
+        return 0
+    day = snapshot[snapshot["match_date"].astype(str) == str(target_date)].copy()
+    if day.empty:
+        return 0
+    key_cols = [col for col in ["match_id", "home_team", "away_team"] if col in day.columns]
+    if not key_cols:
+        return 0
+    return int(day[key_cols].drop_duplicates().shape[0])
+
+
+def _next_dashboard_fixture_date(after_date: str, max_days: int = 14) -> str:
+    """Return the next dashboard date that has local fixture metadata."""
+    try:
+        start = datetime.fromisoformat(str(after_date)).date()
+    except ValueError:
+        return str(after_date)
+
+    for offset in range(1, max_days + 1):
+        candidate = (start + timedelta(days=offset)).isoformat()
+        if _dashboard_fixture_count(candidate) > 0:
+            return candidate
+    return str(after_date)
+
+
+def _resolve_startup_dashboard_date(requested_date: str | None) -> tuple[str, str]:
+    """
+    Choose the date shown on first page load.
+
+    If the user supplied a date we respect it. Otherwise start with today's
+    China date. When today's Sporttery board has fewer open matches than the
+    scheduled fixture count, at least one match has likely kicked off and been
+    removed from betting, so the dashboard advances to the next match day.
+    """
+    if requested_date:
+        return requested_date, "manual"
+
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    try:
+        snapshot = fetch_sporttery_snapshot(["had", "hhad", "crs", "ttg", "hafu"])
+        scheduled = _dashboard_fixture_count(today)
+        open_matches = _sporttery_open_match_count(snapshot, today)
+        if scheduled > 0 and open_matches < scheduled:
+            next_date = _next_dashboard_fixture_date(today)
+            return next_date, f"auto_advanced_open_matches_{open_matches}_of_{scheduled}"
+        return today, f"today_open_matches_{open_matches}_of_{scheduled}"
+    except Exception as exc:
+        print(f"[warn] startup date auto-check failed: {exc}")
+        return today, "auto_check_failed"
+
+
 def _latest_team_value(frame: pd.DataFrame, team: str, value_col: str, target_date: str) -> float | None:
     if frame.empty or "team" not in frame.columns or value_col not in frame.columns:
         return None
@@ -1328,6 +1387,57 @@ def _renormalize_probs(values) -> list[float]:
     if total <= 0:
         return [1 / 3, 1 / 3, 1 / 3]
     return [value / total for value in clipped]
+
+
+def _apply_strength_sanity_adjustment(probabilities, row: dict) -> tuple[list[float], str]:
+    """
+    Nudge no-odds fixtures when the strength gap is extreme.
+
+    This keeps missing-market games from becoming too draw-heavy while still
+    leaving real Sporttery odds in control whenever they are available.
+    """
+    odds_present = all(
+        safe_float(row.get(col)) is not None
+        for col in ["closing_home_odds", "closing_draw_odds", "closing_away_odds"]
+    )
+    if odds_present:
+        return list(probabilities), ""
+
+    score = 0.0
+    components = 0
+    elo_diff = safe_float(row.get("elo_diff"))
+    if elo_diff is not None:
+        score += max(-1.2, min(1.2, elo_diff / 350.0))
+        components += 1
+
+    fifa_diff = safe_float(row.get("fifa_points_diff"))
+    if fifa_diff is not None:
+        score += max(-0.8, min(0.8, fifa_diff / 260.0))
+        components += 1
+
+    fc26_diff = safe_float(row.get("squad_squad_top1_fc26_diff"))
+    if fc26_diff is not None:
+        score += max(-0.9, min(0.9, fc26_diff / 24.0))
+        components += 1
+
+    tm_home = safe_float(row.get("home_squad_squad_top1_tm_value"))
+    tm_away = safe_float(row.get("away_squad_squad_top1_tm_value"))
+    if tm_home is not None and tm_away is not None and tm_home > 0 and tm_away > 0:
+        score += max(-0.9, min(0.9, (math.log1p(tm_home) - math.log1p(tm_away)) / 4.0))
+        components += 1
+
+    if components < 2 or abs(score) < 1.15:
+        return list(probabilities), ""
+
+    adjusted = list(probabilities)
+    target = 0 if score > 0 else 2
+    opposite = 2 if target == 0 else 0
+    shift = min(0.16, 0.045 * abs(score))
+    adjusted[target] += shift
+    adjusted[1] -= shift * 0.55
+    adjusted[opposite] -= shift * 0.45
+    direction = "主队" if target == 0 else "客队"
+    return _renormalize_probs(adjusted), f"缺少真实胜平负赔率，按ELO/FIFA/球星强弱小幅上调{direction}"
 
 
 def _apply_group_motivation_adjustment(probabilities, motivation: dict) -> tuple[list[float], str]:
@@ -1428,18 +1538,16 @@ def _predict_local_model(
     missing = []
     for feature in feature_names:
         value = row.get(feature)
-        if value in ("", None) or pd.isna(value):
+        if value is None or (isinstance(value, str) and value == "") or pd.isna(value):
             value = bundle["medians"].get(feature, 0)
             missing.append(feature)
         values.append(float(value))
 
     X = pd.DataFrame([values], columns=feature_names)
     raw_probabilities = bundle["model"].predict_proba(X)[0]
-    probabilities, motivation_note = _apply_group_motivation_adjustment(raw_probabilities, group_motivation or {})
-    try:
-        prediction = int(bundle["model"].predict(X)[0])
-    except Exception:
-        prediction = max(range(len(probabilities)), key=lambda index: probabilities[index])
+    probabilities, strength_note = _apply_strength_sanity_adjustment(raw_probabilities, row)
+    probabilities, motivation_note = _apply_group_motivation_adjustment(probabilities, group_motivation or {})
+    prediction = max(range(len(probabilities)), key=lambda index: probabilities[index])
     poisson_result = {"available": False}
     poisson_model = bundle.get("poisson_model")
     if poisson_model is not None:
@@ -1471,7 +1579,7 @@ def _predict_local_model(
         "missing_count": len(missing),
         "missing_features": missing[:8],
         "group_motivation": group_motivation or {"available": False},
-        "motivation_note": motivation_note,
+        "motivation_note": "；".join([note for note in [strength_note, motivation_note] if note]),
         "poisson": poisson_result,
     }
 
@@ -2098,6 +2206,91 @@ def _market_signal_for_candidate(match: dict, pool: str, selection: str) -> dict
     return None
 
 
+def _dominant_had_favorite(match: dict) -> dict | None:
+    """
+    Detect a very strong win/draw/win market favorite.
+
+    This guards the strategy layer. When the live market says one side is a
+    heavy favorite, conservative packages should not use the opposite handicap
+    cover just because its standalone EV looks attractive.
+    """
+    if not match.get("had_real_available"):
+        return None
+
+    had = match.get("had") or {}
+    odds = {
+        "home_win": safe_float(had.get("home_odds")),
+        "draw": safe_float(had.get("draw_odds")),
+        "away_win": safe_float(had.get("away_odds")),
+    }
+    probs = {
+        "home_win": safe_float(had.get("home_prob")),
+        "draw": safe_float(had.get("draw_prob")),
+        "away_win": safe_float(had.get("away_prob")),
+    }
+    probs = {key: value for key, value in probs.items() if value is not None}
+    if not probs:
+        return None
+
+    side = max(probs, key=probs.get)
+    side_prob = float(probs[side])
+    side_odds = odds.get(side)
+    if side not in {"home_win", "away_win"}:
+        return None
+
+    if side_prob >= 0.68 or (side_odds is not None and side_odds <= 1.45):
+        return {"side": side, "probability": side_prob, "odds": side_odds}
+    return None
+
+
+def _market_favorite_conflicts(match: dict, pool: str, selection: str) -> bool:
+    favorite = _dominant_had_favorite(match)
+    if not favorite:
+        return False
+
+    side = favorite["side"]
+    text = str(selection or "")
+    pool_text = str(pool or "")
+    hhad = match.get("hhad") or {}
+    handicap = safe_float(hhad.get("handicap_line"))
+
+    if "HAD" in pool_text and "HHAD" not in pool_text:
+        if side == "home_win":
+            return "主胜" not in text
+        return "客胜" not in text
+
+    if "HHAD" in pool_text or text.startswith("让"):
+        # Sporttery HHAD applies the handicap to the home team.
+        # Home favorite giving goals: 让胜 means favorite covers.
+        # Away favorite with home receiving goals: 让负 means favorite covers.
+        if handicap is None:
+            return False
+        if side == "home_win" and handicap < 0:
+            return not text.startswith("让胜")
+        if side == "away_win" and handicap > 0:
+            return not text.startswith("让负")
+    return False
+
+
+def _apply_market_favorite_guard(candidate: dict, match: dict) -> dict:
+    if not _market_favorite_conflicts(
+        match,
+        str(candidate.get("pool") or ""),
+        str(candidate.get("selection") or ""),
+    ):
+        candidate["market_favorite_conflict"] = False
+        return candidate
+
+    guarded = dict(candidate)
+    guarded["market_favorite_conflict"] = True
+    guarded["probability"] = max(0.001, float(guarded.get("probability", 0)) * 0.55)
+    guarded.update(_selection_edge(guarded["probability"], float(guarded.get("odds", 0) or 0)))
+    note = str(guarded.get("note") or "")
+    suffix = "强市场热门保护：该选项逆主流胜负方向，保守包过滤"
+    guarded["note"] = f"{note}；{suffix}" if note else suffix
+    return guarded
+
+
 def _apply_market_signal_to_candidate(candidate: dict, match: dict) -> dict:
     """
     Nudge advice candidates with the live odds-movement decision score.
@@ -2274,6 +2467,8 @@ def _build_betting_package(
             min_draw_edge = 0.03
             if item.get("expected_value", 0) < min_draw_edge:
                 continue
+        if item.get("market_favorite_conflict") and not aggressive:
+            continue
         if match_id in by_match and item.get("odds", 0) > 1 and item.get("probability", 0) >= min_probability:
             by_match[match_id].append(item)
 
@@ -2662,7 +2857,10 @@ def _build_daily_betting_advice(matches: list[dict]) -> dict:
                         "model_pick": str(model.get("pick") or ""),
                     }
                     wdl_candidates.append(
-                        _apply_market_signal_to_candidate(candidate, match)
+                        _apply_market_favorite_guard(
+                            _apply_market_signal_to_candidate(candidate, match),
+                            match,
+                        )
                     )
 
         if match.get("hhad_available"):
@@ -2702,7 +2900,10 @@ def _build_daily_betting_advice(matches: list[dict]) -> dict:
                         "model_pick": str(model.get("pick") or ""),
                     }
                     wdl_candidates.append(
-                        _apply_market_signal_to_candidate(candidate, match)
+                        _apply_market_favorite_guard(
+                            _apply_market_signal_to_candidate(candidate, match),
+                            match,
+                        )
                     )
 
         score_candidates.extend(_exact_score_candidates(match))
@@ -3021,7 +3222,11 @@ def api_dashboard():
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run local World Cup web dashboard.")
-    parser.add_argument("--date", default=DEFAULT_DATE, help="Default date shown by page, YYYY-MM-DD.")
+    parser.add_argument(
+        "--date",
+        default=None,
+        help="Default date shown by page, YYYY-MM-DD. Omit to auto-advance after matches kick off.",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5050)
     parser.add_argument(
@@ -3035,10 +3240,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     global DEFAULT_DATE
-    DEFAULT_DATE = args.date
+    DEFAULT_DATE, date_mode = _resolve_startup_dashboard_date(args.date)
     _schedule_prediction_input_refresh(force=False)
     _schedule_sporttery_snapshot_refresh()
-    print(f"Open http://{args.host}:{args.port}?date={args.date}")
+    print(f"Startup date mode: {date_mode}")
+    print(f"Open http://{args.host}:{args.port}?date={DEFAULT_DATE}")
     app.run(host=args.host, port=args.port, debug=args.debug, use_reloader=args.debug)
 
 
