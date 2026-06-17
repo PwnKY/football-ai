@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,7 @@ RAW_OUTPUT_PATH = RAW_DATA_DIR / "odds_api_worldcup_odds.json"
 BOOKMAKER_OUTPUT_PATH = PROCESSED_DATA_DIR / "odds_api_bookmaker_odds.csv"
 FEATURE_OUTPUT_PATH = PROCESSED_DATA_DIR / "odds_api_match_features.csv"
 USAGE_OUTPUT_PATH = PROCESSED_DATA_DIR / "odds_api_usage.json"
+DEFAULT_AUTO_MAX_AGE_SECONDS = 6 * 60 * 60
 
 
 def _api_key() -> str:
@@ -305,6 +307,139 @@ def save_outputs(payload: list[dict[str, Any]]) -> tuple[pd.DataFrame, pd.DataFr
     bookmaker_odds.to_csv(BOOKMAKER_OUTPUT_PATH, index=False, encoding="utf-8-sig")
     features.to_csv(FEATURE_OUTPUT_PATH, index=False, encoding="utf-8-sig")
     return bookmaker_odds, features
+
+
+def _norm_match_key_value(value: Any) -> str:
+    """Normalize a team/date value for cheap cache-coverage checks."""
+    if pd.isna(value):
+        return ""
+    return normalize_team_name(str(value)).strip().casefold()
+
+
+def _feature_keys(features: pd.DataFrame) -> set[tuple[str, str, str]]:
+    """Return comparable date/home/away keys from odds_api_match_features.csv."""
+    if features.empty:
+        return set()
+    date_col = "shanghai_date" if "shanghai_date" in features.columns else "date"
+    if date_col not in features.columns:
+        return set()
+    keys = set()
+    for row in features.itertuples(index=False):
+        date_value = getattr(row, date_col, "")
+        home = getattr(row, "home_team", "")
+        away = getattr(row, "away_team", "")
+        parsed_date = pd.to_datetime(date_value, errors="coerce")
+        if pd.isna(parsed_date):
+            continue
+        keys.add(
+            (
+                parsed_date.date().isoformat(),
+                _norm_match_key_value(home),
+                _norm_match_key_value(away),
+            )
+        )
+    return keys
+
+
+def _fixture_keys(fixtures: pd.DataFrame, horizon_days: int = 30) -> set[tuple[str, str, str]]:
+    """
+    Return upcoming fixture keys that should be covered by Odds API features.
+
+    The Odds API usually returns upcoming events only, so we do not require old
+    completed games to be present in the cache.
+    """
+    required = {"date", "home_team", "away_team"}
+    if fixtures.empty or not required.issubset(fixtures.columns):
+        return set()
+
+    frame = fixtures[list(required)].copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    today = pd.Timestamp.now(tz="Asia/Shanghai").normalize().tz_localize(None)
+    max_day = today + pd.Timedelta(days=horizon_days)
+    frame = frame[(frame["date"].notna()) & (frame["date"] >= today) & (frame["date"] <= max_day)]
+
+    keys = set()
+    for row in frame.itertuples(index=False):
+        keys.add(
+            (
+                row.date.date().isoformat(),
+                _norm_match_key_value(row.home_team),
+                _norm_match_key_value(row.away_team),
+            )
+        )
+    return keys
+
+
+def _cache_is_stale(max_age_seconds: int) -> bool:
+    if not FEATURE_OUTPUT_PATH.exists():
+        return True
+    age_seconds = time.time() - FEATURE_OUTPUT_PATH.stat().st_mtime
+    return age_seconds > max_age_seconds
+
+
+def ensure_odds_api_cache_for_fixtures(
+    fixtures: pd.DataFrame,
+    sport_key: str = "soccer_fifa_world_cup",
+    regions: str = "eu",
+    markets: str = "h2h",
+    bookmakers: str | None = None,
+    max_age_seconds: int = DEFAULT_AUTO_MAX_AGE_SECONDS,
+    horizon_days: int = 30,
+    force: bool = False,
+) -> bool:
+    """
+    Refresh The Odds API cache when upcoming fixtures need it.
+
+    This is still quota-friendly: one refresh pulls the whole sport/region/market
+    board, rather than calling the API once per fixture.
+
+    Returns True when a new API request was made.
+    """
+    if not os.environ.get(API_KEY_ENV, "").strip():
+        print(f"Missing {API_KEY_ENV}; skipping automatic Odds API refresh.")
+        return False
+
+    should_refresh = force or _cache_is_stale(max_age_seconds)
+    reason = "forced" if force else "stale_or_missing_cache" if should_refresh else ""
+
+    if not should_refresh:
+        try:
+            existing = pd.read_csv(FEATURE_OUTPUT_PATH)
+            feature_keys = _feature_keys(existing)
+            fixture_keys = _fixture_keys(fixtures, horizon_days=horizon_days)
+            # Allow a one-day shift because fixtures are North America local
+            # dates while the API cache also stores Shanghai dates.
+            expanded_feature_keys = set(feature_keys)
+            for date_value, home, away in feature_keys:
+                dt = pd.to_datetime(date_value, errors="coerce")
+                if pd.isna(dt):
+                    continue
+                expanded_feature_keys.add(((dt + pd.Timedelta(days=1)).date().isoformat(), home, away))
+                expanded_feature_keys.add(((dt - pd.Timedelta(days=1)).date().isoformat(), home, away))
+            missing_keys = fixture_keys - expanded_feature_keys
+            if missing_keys:
+                should_refresh = True
+                reason = f"missing_upcoming_fixtures_{len(missing_keys)}"
+        except Exception as exc:
+            should_refresh = True
+            reason = f"cache_check_failed_{type(exc).__name__}"
+
+    if not should_refresh:
+        return False
+
+    print(f"Refreshing Odds API cache ({reason})...")
+    payload = fetch_odds(
+        sport_key=sport_key,
+        regions=regions,
+        markets=markets,
+        bookmakers=bookmakers,
+    )
+    bookmaker_odds, features = save_outputs(payload)
+    print(
+        "Refreshed Odds API cache: "
+        f"events={len(payload)} bookmaker_rows={len(bookmaker_odds)} feature_rows={len(features)}"
+    )
+    return True
 
 
 def parse_args() -> argparse.Namespace:

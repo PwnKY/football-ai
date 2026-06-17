@@ -1,6 +1,7 @@
 ﻿import argparse
 import json
 import math
+import os
 import pickle
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from build_worldcup_features import (
     normalize_team_name,
 )
 from elo_features import add_elo_features
+from fetch_odds_api import ensure_odds_api_cache_for_fixtures
 from group_motivation_features import MOTIVATION_COLUMNS, add_group_motivation_features
 from h2h_features import add_h2h_features
 from odds_api_features import ODDS_API_FEATURE_COLUMNS, add_odds_api_features
@@ -43,6 +45,12 @@ WORLDCUP2026_REPO_FILES = [
     "worldcup2026.stadia.csv",
     "football.matches.json",
 ]
+AUTO_ODDS_API_REFRESH = os.environ.get("AUTO_ODDS_API_REFRESH", "1").strip().lower() not in {"0", "false", "no"}
+ODDS_API_AUTO_MAX_AGE_SECONDS = int(os.environ.get("ODDS_API_AUTO_MAX_AGE_SECONDS", str(6 * 60 * 60)))
+ODDS_API_AUTO_HORIZON_DAYS = int(os.environ.get("ODDS_API_AUTO_HORIZON_DAYS", "30"))
+ODDS_API_AUTO_REGIONS = os.environ.get("ODDS_API_AUTO_REGIONS", "eu")
+ODDS_API_AUTO_MARKETS = os.environ.get("ODDS_API_AUTO_MARKETS", "h2h")
+ODDS_API_AUTO_SPORT_KEY = os.environ.get("ODDS_API_AUTO_SPORT_KEY", "soccer_fifa_world_cup")
 
 
 SPORTTERY_TEAM_MAP = {
@@ -505,6 +513,15 @@ def build_prediction_input_table(
     fixtures = add_current_squad_team_features(fixtures)
     fixtures = add_statsbomb_worldcup_history_features(fixtures)
     fixtures = add_odds_features(fixtures, ODDS_PATH)
+    if AUTO_ODDS_API_REFRESH:
+        ensure_odds_api_cache_for_fixtures(
+            fixtures,
+            sport_key=ODDS_API_AUTO_SPORT_KEY,
+            regions=ODDS_API_AUTO_REGIONS,
+            markets=ODDS_API_AUTO_MARKETS,
+            max_age_seconds=ODDS_API_AUTO_MAX_AGE_SECONDS,
+            horizon_days=ODDS_API_AUTO_HORIZON_DAYS,
+        )
     fixtures = add_odds_api_features(fixtures)
 
     if use_live_sporttery:
