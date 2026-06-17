@@ -65,91 +65,40 @@ def _apply_completed_score_overlay(fixtures: pd.DataFrame, completed_results: pd
     if completed_results.empty:
         return output
 
-    output["_fixture_row_id"] = range(len(output))
-    updates = completed_results[
-        ["date", "home_team", "away_team", "home_score", "away_score"]
-    ].copy()
-    updates = updates.rename(
-        columns={
-            "home_score": "_updated_home_score",
-            "away_score": "_updated_away_score",
-        }
-    )
+    # Keep this as a row-wise lookup instead of a merge. The table is tiny, and
+    # this avoids pandas suffix columns accidentally replacing fixture dates.
+    updates = {}
+    for row in completed_results.itertuples(index=False):
+        date = pd.to_datetime(getattr(row, "date"), errors="coerce")
+        if pd.isna(date):
+            continue
+        home = _normalize_team(getattr(row, "home_team"))
+        away = _normalize_team(getattr(row, "away_team"))
+        home_score = getattr(row, "home_score")
+        away_score = getattr(row, "away_score")
+        if pd.isna(home_score) or pd.isna(away_score):
+            continue
 
-    output["_date_norm"] = pd.to_datetime(output["date"], errors="coerce").dt.normalize()
-    output["_home_norm"] = output["home_team"].map(_normalize_team)
-    output["_away_norm"] = output["away_team"].map(_normalize_team)
+        key = (date.normalize(), home, away)
+        reverse_key = (date.normalize(), away, home)
+        updates[key] = (float(home_score), float(away_score))
+        updates[reverse_key] = (float(away_score), float(home_score))
 
-    direct = output.merge(
-        updates,
-        left_on=["_date_norm", "_home_norm", "_away_norm"],
-        right_on=["date", "home_team", "away_team"],
-        how="left",
-        suffixes=("", "_update"),
-    )
-    has_direct = direct["_updated_home_score"].notna() & direct["_updated_away_score"].notna()
-    direct.loc[has_direct, "home_score"] = direct.loc[has_direct, "_updated_home_score"]
-    direct.loc[has_direct, "away_score"] = direct.loc[has_direct, "_updated_away_score"]
+    for idx, row in output.iterrows():
+        date = pd.to_datetime(row.get("date"), errors="coerce")
+        if pd.isna(date):
+            continue
+        key = (
+            date.normalize(),
+            _normalize_team(row.get("home_team")),
+            _normalize_team(row.get("away_team")),
+        )
+        if key not in updates:
+            continue
 
-    # Some sources may list the nominal home/away sides in the opposite order.
-    still_missing = direct[~has_direct].drop(
-        columns=[
-            "date_update",
-            "home_team_update",
-            "away_team_update",
-            "_updated_home_score",
-            "_updated_away_score",
-        ],
-        errors="ignore",
-    )
-    reversed_updates = updates.rename(
-        columns={
-            "home_team": "_away_norm",
-            "away_team": "_home_norm",
-            "_updated_home_score": "_updated_away_score_reversed",
-            "_updated_away_score": "_updated_home_score_reversed",
-        }
-    )
-    reversed_merge = still_missing.merge(
-        reversed_updates,
-        left_on=["_date_norm", "_home_norm", "_away_norm"],
-        right_on=["date", "_home_norm", "_away_norm"],
-        how="left",
-    )
-    has_reversed = (
-        reversed_merge["_updated_home_score_reversed"].notna()
-        & reversed_merge["_updated_away_score_reversed"].notna()
-    )
-    reversed_merge.loc[has_reversed, "home_score"] = reversed_merge.loc[
-        has_reversed, "_updated_home_score_reversed"
-    ]
-    reversed_merge.loc[has_reversed, "away_score"] = reversed_merge.loc[
-        has_reversed, "_updated_away_score_reversed"
-    ]
+        output.loc[idx, "home_score"] = updates[key][0]
+        output.loc[idx, "away_score"] = updates[key][1]
 
-    direct_done = direct[has_direct].drop(
-        columns=[
-            "date_update",
-            "home_team_update",
-            "away_team_update",
-            "_updated_home_score",
-            "_updated_away_score",
-        ],
-        errors="ignore",
-    )
-    output = pd.concat([direct_done, reversed_merge], ignore_index=True)
-    output = output.sort_values("_fixture_row_id").drop(
-        columns=[
-            "_fixture_row_id",
-            "_date_norm",
-            "_home_norm",
-            "_away_norm",
-            "date_update",
-            "_updated_away_score_reversed",
-            "_updated_home_score_reversed",
-        ],
-        errors="ignore",
-    )
     return output
 
 
